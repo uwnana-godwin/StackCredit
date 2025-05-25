@@ -161,3 +161,87 @@
     )
   )
 )
+
+;; Repay Loan
+;; Allows partial or full loan repayment with automatic collateral release
+;; Successful repayments improve credit score
+(define-public (repay-loan
+    (loan-id uint)
+    (amount uint)
+  )
+  (let (
+      (sender tx-sender)
+      (loan (unwrap! (map-get? Loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+    )
+    ;; Validate repayment request
+    (asserts! (is-eq sender (get borrower loan)) ERR-UNAUTHORIZED)
+    (asserts! (get is-active loan) ERR-LOAN-NOT-FOUND)
+    (asserts! (not (get is-defaulted loan)) ERR-LOAN-DEFAULTED)
+    (asserts! (<= loan-id (var-get next-loan-id)) ERR-INVALID-LOAN-ID)
+    ;; Process repayment
+    (let ((total-due (calculate-total-due loan)))
+      (asserts! (>= amount u0) ERR-INVALID-AMOUNT)
+      ;; Transfer repayment to contract
+      (try! (stx-transfer? amount sender (as-contract tx-sender)))
+      ;; Update loan repayment status
+      (let ((new-repaid-amount (+ (get repaid-amount loan) amount)))
+        (map-set Loans { loan-id: loan-id }
+          (merge loan {
+            repaid-amount: new-repaid-amount,
+            is-active: (< new-repaid-amount total-due),
+          })
+        )
+        ;; Handle full repayment: improve credit score and release collateral
+        (if (>= new-repaid-amount total-due)
+          (begin
+            (try! (update-credit-score sender true loan))
+            (as-contract (try! (stx-transfer? (get collateral loan) tx-sender sender)))
+            (var-set total-stx-locked
+              (- (var-get total-stx-locked) (get collateral loan))
+            )
+          )
+          true
+        )
+        (ok true)
+      )
+    )
+  )
+)
+
+;; ADMINISTRATIVE FUNCTIONS
+
+;; Mark Loan as Defaulted
+;; Allows contract owner to mark overdue loans as defaulted
+;; Defaulted loans negatively impact borrower's credit score
+(define-public (mark-loan-defaulted (loan-id uint))
+  (let ((loan (unwrap! (map-get? Loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND)))
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (>= stacks-block-height (get due-height loan)) ERR-NOT-DUE)
+    (asserts! (get is-active loan) ERR-LOAN-NOT-FOUND)
+    (asserts! (<= loan-id (var-get next-loan-id)) ERR-INVALID-LOAN-ID)
+    ;; Mark loan as defaulted and inactive
+    (map-set Loans { loan-id: loan-id }
+      (merge loan {
+        is-defaulted: true,
+        is-active: false,
+      })
+    )
+    ;; Apply credit score penalty for default
+    (try! (update-credit-score (get borrower loan) false loan))
+    (ok true)
+  )
+)
+
+;; PRIVATE HELPER FUNCTIONS
+
+;; Calculate Required Collateral
+;; Determines collateral amount based on credit score
+;; Higher scores = lower collateral requirements
+(define-private (calculate-required-collateral
+    (amount uint)
+    (score uint)
+  )
+  (let ((collateral-ratio (- u100 (/ (* score u50) u100))))
+    (/ (* amount collateral-ratio) u100)
+  )
+)
