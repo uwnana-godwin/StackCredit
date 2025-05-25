@@ -83,3 +83,81 @@
   { user: principal }
   { active-loans: (list 20 uint) }
 )
+
+;; STATE VARIABLES
+
+;; Auto-incrementing loan ID counter
+(define-data-var next-loan-id uint u0)
+
+;; Total STX locked as collateral across all loans
+(define-data-var total-stx-locked uint u0)
+
+;; PUBLIC FUNCTIONS
+
+;; Initialize User Credit Profile
+;; Creates a new credit profile with minimum score for first-time users
+;; Must be called before requesting any loans
+(define-public (initialize-score)
+  (let ((sender tx-sender))
+    (asserts! (is-none (map-get? UserScores { user: sender })) ERR-UNAUTHORIZED)
+    (ok (map-set UserScores { user: sender } {
+      score: MIN-SCORE,
+      total-borrowed: u0,
+      total-repaid: u0,
+      loans-taken: u0,
+      loans-repaid: u0,
+      last-update: stacks-block-height,
+    }))
+  )
+)
+
+;; Request New Loan
+;; Creates a new loan with dynamic collateral requirements based on credit score
+;; Higher credit scores require less collateral and receive better interest rates
+(define-public (request-loan
+    (amount uint)
+    (collateral uint)
+    (duration uint)
+  )
+  (let (
+      (sender tx-sender)
+      (loan-id (+ (var-get next-loan-id) u1))
+      (user-score (unwrap! (map-get? UserScores { user: sender }) ERR-UNAUTHORIZED))
+      (active-loans (default-to { active-loans: (list) } (map-get? UserLoans { user: sender })))
+    )
+    ;; Validate loan request parameters
+    (asserts! (>= (get score user-score) MIN-LOAN-SCORE) ERR-INSUFFICIENT-SCORE)
+    (asserts! (<= (len (get active-loans active-loans)) MAX-ACTIVE-LOANS)
+      ERR-ACTIVE-LOAN
+    )
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (and (> duration u0) (<= duration MAX-LOAN-DURATION))
+      ERR-INVALID-DURATION
+    )
+    ;; Calculate and validate collateral requirements
+    (let ((required-collateral (calculate-required-collateral amount (get score user-score))))
+      (asserts! (>= collateral required-collateral) ERR-INSUFFICIENT-BALANCE)
+      ;; Lock collateral from borrower
+      (try! (stx-transfer? collateral sender (as-contract tx-sender)))
+      ;; Create loan record
+      (map-set Loans { loan-id: loan-id } {
+        borrower: sender,
+        amount: amount,
+        collateral: collateral,
+        due-height: (+ stacks-block-height duration),
+        interest-rate: (calculate-interest-rate (get score user-score)),
+        is-active: true,
+        is-defaulted: false,
+        repaid-amount: u0,
+      })
+      ;; Update user's active loan list
+      (try! (update-user-loans sender loan-id))
+      ;; Transfer loan amount to borrower
+      (as-contract (try! (stx-transfer? amount tx-sender sender)))
+      ;; Update system counters
+      (var-set next-loan-id loan-id)
+      (var-set total-stx-locked (+ (var-get total-stx-locked) collateral))
+      (ok loan-id)
+    )
+  )
+)
